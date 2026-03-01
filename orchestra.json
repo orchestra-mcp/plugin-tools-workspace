@@ -1,0 +1,23 @@
+{
+    "name": "orchestra-mcp/plugin-tools-workspace",
+    "description": "Multi-folder workspace management with switching support.",
+    "type": "tools",
+    "license": "MIT",
+    "homepage": "https://orchestra-mcp.dev",
+    "support": {
+        "issues": "https://github.com/orchestra-mcp/plugin-tools-workspace/issues",
+        "source": "https://github.com/orchestra-mcp/plugin-tools-workspace"
+    },
+    "require": {
+        "orchestra-mcp/gen-go": "^0.1.0",
+        "orchestra-mcp/sdk-go": "^0.1.0"
+    },
+    "bin": "tools-workspace",
+    "extra": {
+        "plugin-id": "tools.workspace",
+        "provides": ["tools"],
+        "branch-alias": {
+            "dev-master": "0.1.x-dev"
+        }
+    }
+}
