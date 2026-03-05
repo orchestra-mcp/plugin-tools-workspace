@@ -1,56 +1,37 @@
 // Package store provides the data layer for the tools.workspace plugin.
 // WorkspaceStore handles CRUD operations on workspaces, persisted to
-// ~/.orchestra/workspaces.json.
+// globaldb (~/.orchestra/db/global.db). No markdown export — workspaces are
+// local machine config and must NOT be synced via git.
 package store
 
 import (
-	"encoding/json"
 	"fmt"
 	"math/rand"
-	"os"
-	"path/filepath"
-	"sync"
 	"time"
+
+	"github.com/orchestra-mcp/sdk-go/globaldb"
 )
 
 // Workspace represents a named collection of project folders.
-type Workspace struct {
-	ID            string            `json:"id"`
-	Name          string            `json:"name"`
-	Folders       []string          `json:"folders"`
-	PrimaryFolder string            `json:"primary_folder"`
-	CreatedAt     string            `json:"created_at"`
-	LastUsed      string            `json:"last_used"`
-	Metadata      map[string]string `json:"metadata,omitempty"`
-}
+// This is a thin wrapper around globaldb.Workspace for backward compatibility.
+type Workspace = globaldb.Workspace
 
-// Registry is the top-level structure persisted to disk.
+// Registry is the top-level structure for listing workspaces.
 type Registry struct {
 	Workspaces        []*Workspace `json:"workspaces"`
 	ActiveWorkspaceID string       `json:"active_workspace_id"`
 }
 
-// WorkspaceStore provides thread-safe CRUD operations on the workspace registry.
-type WorkspaceStore struct {
-	mu   sync.Mutex
-	path string
-}
+// WorkspaceStore provides thread-safe CRUD operations on the workspace registry
+// via globaldb. All mutations go through the global SQLite database.
+type WorkspaceStore struct{}
 
-// NewWorkspaceStore creates a new store. Ensures the directory exists.
+// NewWorkspaceStore creates a new store. The global database is lazily
+// initialized on first use.
 func NewWorkspaceStore() (*WorkspaceStore, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("get home dir: %w", err)
-	}
-
-	dir := filepath.Join(home, ".orchestra")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("create orchestra dir: %w", err)
-	}
-
-	return &WorkspaceStore{
-		path: filepath.Join(dir, "workspaces.json"),
-	}, nil
+	// Migrate existing JSON workspaces into globaldb on first use.
+	globaldb.MigrateWorkspacesJSON()
+	return &WorkspaceStore{}, nil
 }
 
 // NewWorkspaceID generates an ID in the format "WS-XXXX".
@@ -63,78 +44,25 @@ func NewWorkspaceID() string {
 	return "WS-" + string(b)
 }
 
-// load reads the registry from disk.
-func (s *WorkspaceStore) load() (*Registry, error) {
-	data, err := os.ReadFile(s.path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &Registry{}, nil
-		}
-		return nil, fmt.Errorf("read workspaces file: %w", err)
-	}
-	var reg Registry
-	if err := json.Unmarshal(data, &reg); err != nil {
-		return nil, fmt.Errorf("unmarshal workspaces: %w", err)
-	}
-	return &reg, nil
-}
-
-// save writes the registry to disk.
-func (s *WorkspaceStore) save(reg *Registry) error {
-	data, err := json.MarshalIndent(reg, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal workspaces: %w", err)
-	}
-	if err := os.WriteFile(s.path, data, 0o644); err != nil {
-		return fmt.Errorf("write workspaces file: %w", err)
-	}
-	return nil
-}
-
-// findByID returns the workspace and its index, or -1 if not found.
-func findByID(reg *Registry, id string) (*Workspace, int) {
-	for i, ws := range reg.Workspaces {
-		if ws.ID == id {
-			return ws, i
-		}
-	}
-	return nil, -1
-}
-
 // List returns all workspaces and the active workspace ID.
 func (s *WorkspaceStore) List() (*Registry, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.load()
+	ws, err := globaldb.ListWorkspaces()
+	if err != nil {
+		return nil, err
+	}
+	return &Registry{
+		Workspaces:        ws,
+		ActiveWorkspaceID: globaldb.GetActiveWorkspaceID(),
+	}, nil
 }
 
 // Get returns a single workspace by ID.
 func (s *WorkspaceStore) Get(id string) (*Workspace, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	reg, err := s.load()
-	if err != nil {
-		return nil, err
-	}
-
-	ws, _ := findByID(reg, id)
-	if ws == nil {
-		return nil, fmt.Errorf("workspace %q not found", id)
-	}
-	return ws, nil
+	return globaldb.GetWorkspace(id)
 }
 
 // Create adds a new workspace and returns it.
 func (s *WorkspaceStore) Create(name string, folders []string) (*Workspace, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	reg, err := s.load()
-	if err != nil {
-		return nil, err
-	}
-
 	now := time.Now().UTC().Format(time.RFC3339)
 	primary := ""
 	if len(folders) > 0 {
@@ -151,82 +79,56 @@ func (s *WorkspaceStore) Create(name string, folders []string) (*Workspace, erro
 		Metadata:      make(map[string]string),
 	}
 
-	reg.Workspaces = append(reg.Workspaces, ws)
-
-	// If this is the first workspace, auto-activate it.
-	if reg.ActiveWorkspaceID == "" {
-		reg.ActiveWorkspaceID = ws.ID
-	}
-
-	if err := s.save(reg); err != nil {
+	if err := globaldb.CreateWorkspace(ws); err != nil {
 		return nil, err
 	}
+
+	// If this is the first workspace, auto-activate it.
+	if globaldb.GetActiveWorkspaceID() == "" {
+		globaldb.SetActiveWorkspaceID(ws.ID)
+	}
+
 	return ws, nil
 }
 
 // Update modifies an existing workspace via a mutation function.
 func (s *WorkspaceStore) Update(id string, fn func(ws *Workspace)) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	reg, err := s.load()
+	ws, err := globaldb.GetWorkspace(id)
 	if err != nil {
 		return err
 	}
-
-	ws, _ := findByID(reg, id)
-	if ws == nil {
-		return fmt.Errorf("workspace %q not found", id)
-	}
-
 	fn(ws)
-	return s.save(reg)
+	return globaldb.SaveWorkspace(ws)
 }
 
 // Delete removes a workspace by ID.
 func (s *WorkspaceStore) Delete(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	reg, err := s.load()
-	if err != nil {
+	if err := globaldb.DeleteWorkspace(id); err != nil {
 		return err
 	}
-
-	_, idx := findByID(reg, id)
-	if idx < 0 {
-		return fmt.Errorf("workspace %q not found", id)
+	// Clear active workspace if we deleted it.
+	if globaldb.GetActiveWorkspaceID() == id {
+		globaldb.SetActiveWorkspaceID("")
 	}
-
-	reg.Workspaces = append(reg.Workspaces[:idx], reg.Workspaces[idx+1:]...)
-	if reg.ActiveWorkspaceID == id {
-		reg.ActiveWorkspaceID = ""
-	}
-
-	return s.save(reg)
+	return nil
 }
 
 // Switch sets the active workspace and updates its LastUsed timestamp.
 func (s *WorkspaceStore) Switch(id string) (*Workspace, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	reg, err := s.load()
+	ws, err := globaldb.GetWorkspace(id)
 	if err != nil {
 		return nil, err
 	}
 
-	ws, _ := findByID(reg, id)
-	if ws == nil {
-		return nil, fmt.Errorf("workspace %q not found", id)
-	}
-
-	reg.ActiveWorkspaceID = id
 	ws.LastUsed = time.Now().UTC().Format(time.RFC3339)
-
-	if err := s.save(reg); err != nil {
+	if err := globaldb.SaveWorkspace(ws); err != nil {
 		return nil, err
 	}
+
+	if err := globaldb.SetActiveWorkspaceID(id); err != nil {
+		return nil, err
+	}
+
 	return ws, nil
 }
 
@@ -244,17 +146,9 @@ func (s *WorkspaceStore) AddFolder(id, folder string) error {
 
 // RemoveFolder removes a folder from a workspace. Errors if it would leave zero folders.
 func (s *WorkspaceStore) RemoveFolder(id, folder string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	reg, err := s.load()
+	ws, err := globaldb.GetWorkspace(id)
 	if err != nil {
 		return err
-	}
-
-	ws, _ := findByID(reg, id)
-	if ws == nil {
-		return fmt.Errorf("workspace %q not found", id)
 	}
 
 	idx := -1
@@ -278,5 +172,5 @@ func (s *WorkspaceStore) RemoveFolder(id, folder string) error {
 		ws.PrimaryFolder = ws.Folders[0]
 	}
 
-	return s.save(reg)
+	return globaldb.SaveWorkspace(ws)
 }
